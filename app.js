@@ -41,9 +41,9 @@ const CONFIG = {
   slotCount: 100,       // slots are numbered 00–99, like the jukebox
   indexPerPage: 25,
   slotsPerCard: 2,      // each title card: one disc on the top half, the next on the bottom
-  // Title card size and sheet layout, in inches. The card size is measured from a photo with a ruler;
-  // confirm it with a ruler before the first print run.
-  card: { w: 2.9375, h: 4.8125, gap: 0.25, cols: 2, perSheet: 4, sheetW: 8.5, sheetH: 11 },
+  // Title card size and sheet layout, in inches. The cards are 3 × 5 5/8 in (measured 11/2). Two rows
+  // of upright cards would need 11.25 in, so each letter sheet holds 3 cards turned sideways and stacked.
+  card: { w: 3, h: 5.625, gap: 0.25, perSheet: 3, sheetW: 8.5, sheetH: 11 },
   idleMinutes: 2,
   newDays: 14,
   paper: 'letter',      // binder page size; A5 would need its own entry in PAPER
@@ -784,7 +784,7 @@ function cardHalfHTML(slot, withHints) {
   return `<div class="tc-half">${labels}
       <div class="tc-artist">${esc(a.artist)}</div>
       <div class="tc-title">${esc(a.title)}${a.discs.length > 1 ? ` (disc ${v.disc})` : ''}</div>
-      <div class="tc-tracks${list.length > 15 ? ' two-col' : ''}">${rows}</div></div>`;
+      <div class="tc-tracks">${rows}</div></div>`;
 }
 function titleCardBodyHTML(k) {
   const first = k * CONFIG.slotsPerCard;
@@ -796,22 +796,47 @@ function titleCardHTML(k, actions = '') {
   return `<div class="card-item">${titleCardBodyHTML(k)}
     <span class="page-cap">Discs ${pad2(first)} and ${pad2(first + 1)} (card ${k + 1} of ${cards}). It replaces that card in the jukebox's display.</span>${actions}</div>`;
 }
-// How up to 4 cards sit on one letter sheet: 2 × 2, centered, with a gap to trim.
+// How up to 3 cards sit on one letter sheet: turned sideways (5 5/8 wide × 3 tall on the page),
+// stacked and centered, with a gap between them to trim. Each card still reads upright once cut out.
 function sheetPreviewHTML(keys) {
   const c = CONFIG.card;
-  const rows = Math.ceil(c.perSheet / c.cols);
-  const left0 = (c.sheetW - (c.cols * c.w + (c.cols - 1) * c.gap)) / 2;
-  const top0 = (c.sheetH - (rows * c.h + (rows - 1) * c.gap)) / 2;
+  const fw = c.h, fh = c.w;      // the card's footprint on the page, turned sideways
+  const left0 = (c.sheetW - fw) / 2;
+  const top0 = (c.sheetH - (c.perSheet * fh + (c.perSheet - 1) * c.gap)) / 2;
+  const pct = (v, of) => (v / of * 100).toFixed(3) + '%';
   let h = '';
   for (let i = 0; i < c.perSheet; i++) {
-    const col = i % c.cols, row = Math.floor(i / c.cols);
-    const pos = `left:${((left0 + col * (c.w + c.gap)) / c.sheetW * 100).toFixed(3)}%;top:${((top0 + row * (c.h + c.gap)) / c.sheetH * 100).toFixed(3)}%;width:${(c.w / c.sheetW * 100).toFixed(3)}%;height:${(c.h / c.sheetH * 100).toFixed(3)}%`;
+    const pos = `left:${pct(left0, c.sheetW)};top:${pct(top0 + i * (fh + c.gap), c.sheetH)};width:${pct(fw, c.sheetW)};height:${pct(fh, c.sheetH)}`;
     h += keys[i]
       ? `<div class="sheet-slot" style="${pos}">${titleCardBodyHTML(+keys[i].split(':')[1])}</div>`
       : `<div class="sheet-slot unused" style="${pos}"></div>`;
   }
   return `<div class="sheet-page">${h}</div>`;
 }
+// Fits each card's song list: 9 pt in one column if it fits, then 8.5 and 8 pt, then two columns
+// from 9 pt down to 6 pt. The cards must be laid out (on screen, or in the print area while it's
+// being measured) for this to work.
+const FIT_STEPS = [[9, 1], [8.5, 1], [8, 1], [9, 2], [8.5, 2], [8, 2], [7.5, 2], [7, 2], [6.5, 2], [6, 2]];
+function fitCards(root) {
+  root.querySelectorAll('.tc-half').forEach(half => {
+    const box = half.querySelector('.tc-tracks');
+    if (!box) return;
+    const n = box.children.length;
+    let i = n > 15 ? FIT_STEPS.findIndex(s => s[1] === 2) : 0;   // long discs skip straight to two columns
+    for (; i < FIT_STEPS.length; i++) {
+      const [size, cols] = FIT_STEPS[i];
+      half.style.setProperty('--tk', size);
+      box.classList.toggle('two-col', cols === 2);
+      if (box.scrollHeight <= box.clientHeight + 1 && box.scrollWidth <= box.clientWidth + 1) return;
+    }
+  });
+}
+function fitCardsSoon(root) {
+  fitCards(root);
+  // Fonts can arrive a moment later and change the measurements, so fit once more when they're in.
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fitCards(root));
+}
+
 // One binder page (index or album), without the caption around it.
 function pageBodyHTML(key) {
   const [kind, ref] = key.split(':');
@@ -902,9 +927,15 @@ function runPrint(html) {
   return new Promise(resolve => {
     const area = $('#printArea');
     area.innerHTML = html;
+    // Lay the pages out off screen at full size: covers start loading, and the song lists are fitted.
+    area.classList.add('measuring');
     const imgs = Array.from(area.querySelectorAll('img'));
+    imgs.forEach(i => { i.loading = 'eager'; });
     const loaded = Promise.all(imgs.map(i => (i.complete ? null : new Promise(r => { i.addEventListener('load', r, { once: true }); i.addEventListener('error', r, { once: true }); }))));
-    Promise.race([loaded, new Promise(r => setTimeout(r, 4000))]).then(() => {
+    const fonts = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+    Promise.race([Promise.all([loaded, fonts]), new Promise(r => setTimeout(r, 4000))]).then(() => {
+      fitCards(area);
+      area.classList.remove('measuring');
       if (window.fully && typeof window.fully.print === 'function') {
         window.fully.print();
         setTimeout(resolve, 1500);
@@ -1059,12 +1090,13 @@ function renderManage() {
                <p class="muted small">Plain letter paper. Each page says in its top corner where it goes in the binder.</p>
                <div class="pages">${pageKeys.map(k => pageHTML(k, actions(k, 'page'))).join('')}</div>` : ''}
              ${cardKeys.length ? `<h2 class="section-title">Jukebox title cards (${cardKeys.length})</h2>
-               <p class="muted small">Cards print 4 to a letter sheet of heavy paper, front side only (${sheets} sheet${sheets > 1 ? 's' : ''} here). Each card has a thin border to line up on the paper cutter, with a small gap between cards to trim away. If you print pages and cards together, load the heavy paper when the card sheets come up.</p>
+               <p class="muted small">Cards print 3 to a letter sheet of heavy paper, turned sideways, front side only (${sheets} sheet${sheets > 1 ? 's' : ''} here). Each card has a thin border to line up on the paper cutter, with a small gap between cards to trim away. If you print pages and cards together, load the heavy paper when the card sheets come up.</p>
                <div class="sheet-preview">${sheetPreviewHTML(cardKeys.slice(0, CONFIG.card.perSheet))}
                  <span class="page-cap">How the first sheet prints${sheets > 1 ? ` (1 of ${sheets})` : ''}.</span></div>
                <div class="cards-list">${cardKeys.map(k => pageHTML(k, actions(k, 'card'))).join('')}</div>` : ''}`
           : `<div class="empty-state"><h2>Nothing to print.</h2><p class="muted">The binder and the jukebox cards match the catalog. Swaps and new albums add items here.</p></div>`}
         ${extras}`;
+      fitCardsSoon(el);
       break;
     }
     case 'swap-done': {
@@ -1156,7 +1188,7 @@ const GUIDES = [
       'Tap Pages to print. The number shows how many pages changed.',
       "Tap Print everything, or tap Print this page under one page. Tap Skip for a page you don't need.",
       'The print screen opens. Check that it shows your printer, then tap the round Print button.',
-      'Title cards print 4 to a sheet on heavy paper. Cut them apart on the paper cutter along the thin border around each card.',
+      'Title cards print 3 to a sheet on heavy paper. Cut them apart on the paper cutter along the thin border around each card.',
       'Each page says in its top corner where it goes. Put it in the binder and throw away the old page.',
       'Back at the tablet, answer whether everything printed. Then tap Clear printed.',
     ] },
