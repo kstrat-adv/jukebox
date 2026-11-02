@@ -346,12 +346,11 @@ h1, h2, h3 { margin: 0; text-wrap: balance; }
   border: 1px solid var(--ink);   /* the thin cut line for the paper cutter */
   display: flex; overflow: hidden; font-family: var(--f-narrow);
 }
-/* One letter sheet: 3 cards turned sideways and stacked, with a gap between them to trim */
+/* One letter sheet in landscape: 3 upright cards side by side, with a gap between them to trim */
 .sheet-preview { display: flex; flex-direction: column; gap: 8px; }
-.sheet-page { position: relative; width: min(440px, 100%); aspect-ratio: 8.5 / 11; background: var(--paper); box-shadow: var(--cover-shadow); border-radius: 3px; }
-.sheet-slot { position: absolute; container-type: size; }
-.sheet-slot .tcard { position: absolute; left: 50%; top: 50%; width: 100cqh; height: 100cqw; aspect-ratio: auto; box-shadow: none;
-  transform: translate(-50%, -50%) rotate(-90deg); }
+.sheet-page { position: relative; width: min(620px, 100%); aspect-ratio: 11 / 8.5; background: var(--paper); box-shadow: var(--cover-shadow); border-radius: 3px; }
+.sheet-slot { position: absolute; }
+.sheet-slot .tcard { width: 100%; height: 100%; aspect-ratio: auto; box-shadow: none; }
 .sheet-slot.unused { border: 1px dashed var(--rule); }
 .tc-in { --pt: calc(100cqw / 216); flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; padding: calc(5 * var(--pt)) calc(10 * var(--pt)); }
 .tc-half { --tk: 9; flex: 1 1 0; min-height: 0; min-width: 0; display: flex; flex-direction: column; gap: calc(3 * var(--pt)); overflow: hidden; padding-block: calc(5 * var(--pt)); }
@@ -474,7 +473,12 @@ h1, h2, h3 { margin: 0; text-wrap: balance; }
 #printArea { display: none; }
 /* Before printing, the pages are laid out off screen at full size so the songs can be fitted to each card. */
 #printArea.measuring { display: block; position: fixed; left: -20000px; top: 0; visibility: hidden; }
-.print-page, .print-sheet { width: 8.5in; height: 11in; overflow: hidden; position: relative; background: #ffffff; }
+.print-page { width: 8.5in; height: 11in; overflow: hidden; position: relative; background: #ffffff; }
+.print-sheet { width: 11in; height: 8.5in; overflow: hidden; position: relative; background: #ffffff; }
+/* On the kiosk, a landscape sheet is turned onto a portrait page (see setPageShape in app.js). */
+#printArea.turned .print-sheet { width: 8.5in; height: 11in; }
+#printArea.turned .print-sheet .sheet-page { position: absolute; left: 50%; top: 50%; width: 11in !important; height: 8.5in !important;
+  transform: translate(-50%, -50%) rotate(90deg); }
 .guide-page { width: 100%; height: 100%; padding: 0.8in 0.9in; display: flex; flex-direction: column; gap: 0.22in; background: var(--paper); color: var(--ink); font-family: var(--font-body); }
 .gp-top { font-size: 10pt; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; border-bottom: 1pt solid var(--ink); padding-bottom: 0.08in; }
 .guide-page h1 { font-family: var(--font-display); font-weight: 400; font-size: 30pt; line-height: 1.05; }

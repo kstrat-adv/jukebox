@@ -41,9 +41,9 @@ const CONFIG = {
   slotCount: 100,       // slots are numbered 00–99, like the jukebox
   indexPerPage: 25,
   slotsPerCard: 2,      // each title card: one disc on the top half, the next on the bottom
-  // Title card size and sheet layout, in inches. The cards are 3 × 5 5/8 in (measured 11/2). Two rows
-  // of upright cards would need 11.25 in, so each letter sheet holds 3 cards turned sideways and stacked.
-  card: { w: 3, h: 5.625, gap: 0.25, perSheet: 3, sheetW: 8.5, sheetH: 11 },
+  // Title card size and sheet layout, in inches. The cards are 3 × 5 5/8 in (measured 11/2), so a
+  // letter sheet turned landscape holds 3 upright cards side by side.
+  card: { w: 3, h: 5.625, gap: 0.25, perSheet: 3, sheetW: 11, sheetH: 8.5 },
   idleMinutes: 2,
   newDays: 14,
   paper: 'letter',      // binder page size; A5 would need its own entry in PAPER
@@ -796,17 +796,16 @@ function titleCardHTML(k, actions = '') {
   return `<div class="card-item">${titleCardBodyHTML(k)}
     <span class="page-cap">Discs ${pad2(first)} and ${pad2(first + 1)} (card ${k + 1} of ${cards}). It replaces that card in the jukebox's display.</span>${actions}</div>`;
 }
-// How up to 3 cards sit on one letter sheet: turned sideways (5 5/8 wide × 3 tall on the page),
-// stacked and centered, with a gap between them to trim. Each card still reads upright once cut out.
+// How up to 3 cards sit on one letter sheet in landscape: upright, side by side, centered,
+// with a gap between them to trim.
 function sheetPreviewHTML(keys) {
   const c = CONFIG.card;
-  const fw = c.h, fh = c.w;      // the card's footprint on the page, turned sideways
-  const left0 = (c.sheetW - fw) / 2;
-  const top0 = (c.sheetH - (c.perSheet * fh + (c.perSheet - 1) * c.gap)) / 2;
+  const left0 = (c.sheetW - (c.perSheet * c.w + (c.perSheet - 1) * c.gap)) / 2;
+  const top0 = (c.sheetH - c.h) / 2;
   const pct = (v, of) => (v / of * 100).toFixed(3) + '%';
   let h = '';
   for (let i = 0; i < c.perSheet; i++) {
-    const pos = `left:${pct(left0, c.sheetW)};top:${pct(top0 + i * (fh + c.gap), c.sheetH)};width:${pct(fw, c.sheetW)};height:${pct(fh, c.sheetH)}`;
+    const pos = `left:${pct(left0 + i * (c.w + c.gap), c.sheetW)};top:${pct(top0, c.sheetH)};width:${pct(c.w, c.sheetW)};height:${pct(c.h, c.sheetH)}`;
     h += keys[i]
       ? `<div class="sheet-slot" style="${pos}">${titleCardBodyHTML(+keys[i].split(':')[1])}</div>`
       : `<div class="sheet-slot unused" style="${pos}"></div>`;
@@ -905,10 +904,12 @@ function pageOrder(x, y) {
   if (kx !== ky) return kx === 'index' ? -1 : 1;
   return kx === 'index' ? +rx - +ry : byArtist(BY_ID[rx], BY_ID[ry]);
 }
-function printHTML(keys) {
-  const pages = keys.filter(k => !k.startsWith('card:')).sort(pageOrder);
-  const cards = keys.filter(k => k.startsWith('card:')).sort(byCardNo);
-  let h = pages.map(k => `<div class="print-page">${pageBodyHTML(k)}</div>`).join('');
+// Binder pages (portrait) and title card sheets (landscape) print as separate jobs, so each job has
+// one page shape, and there's a pause to load the card stock between them.
+function pagesHTML(keys) { return keys.slice().sort(pageOrder).map(k => `<div class="print-page">${pageBodyHTML(k)}</div>`).join(''); }
+function cardSheetsHTML(keys) {
+  const cards = keys.slice().sort(byCardNo);
+  let h = '';
   for (let i = 0; i < cards.length; i += CONFIG.card.perSheet) {
     h += `<div class="print-sheet">${sheetPreviewHTML(cards.slice(i, i + CONFIG.card.perSheet))}</div>`;
   }
@@ -923,9 +924,20 @@ function guidePrintHTML(list) {
 }
 // Put the pages in the print area, wait for cover images, then open the print screen.
 // On the kiosk, Fully Kiosk's own print call is used when it's there.
-function runPrint(html) {
+// Card sheets are landscape. A computer's browser takes that from the page itself. The kiosk
+// (Fully Kiosk on Android) prints portrait unless someone changes it, so there the landscape sheet is
+// turned a quarter turn onto a portrait page instead: the cards come out exactly the same size.
+function setPageShape(landscape) {
+  let tag = document.getElementById('pageShape');
+  if (!tag) { tag = document.createElement('style'); tag.id = 'pageShape'; document.head.appendChild(tag); }
+  const turn = landscape && !!(window.fully && typeof window.fully.print === 'function');
+  $('#printArea').classList.toggle('turned', turn);
+  tag.textContent = `@page { size: letter ${landscape && !turn ? 'landscape' : 'portrait'}; margin: 0; }`;
+}
+function runPrint(html, landscape) {
   return new Promise(resolve => {
     const area = $('#printArea');
+    setPageShape(!!landscape);
     area.innerHTML = html;
     // Lay the pages out off screen at full size: covers start loading, and the song lists are fitted.
     area.classList.add('measuring');
@@ -958,9 +970,24 @@ async function printKeys(keys) {
     renderManage();
     return;
   }
-  await runPrint(printHTML(keys));
-  const yes = await ask('Did everything come out of the printer?', 'Yes, mark it printed', 'No, keep it on the list');
-  if (yes) { await Actions.printed(keys); toast('Marked as printed.'); }
+  const pages = keys.filter(k => !k.startsWith('card:'));
+  const cards = keys.filter(k => k.startsWith('card:'));
+  let done = 0;
+  if (pages.length) {
+    await runPrint(pagesHTML(pages), false);
+    const ok = await ask(`Did the binder page${pages.length > 1 ? 's' : ''} come out of the printer?`, 'Yes, mark printed', 'No, keep on the list');
+    if (ok) { Actions.printed(pages); done += pages.length; }
+  }
+  if (cards.length) {
+    const sheets = Math.ceil(cards.length / CONFIG.card.perSheet);
+    const go = !pages.length || await ask(`Next, the title cards (${sheets} sheet${sheets > 1 ? 's' : ''}). Put card stock in the manual feed slot, then tap Print the cards.`, 'Print the cards', 'Not now');
+    if (go) {
+      await runPrint(cardSheetsHTML(cards), true);
+      const ok = await ask(`Did the title card sheet${sheets > 1 ? 's' : ''} come out of the printer?`, 'Yes, mark printed', 'No, keep on the list');
+      if (ok) { Actions.printed(cards); done += cards.length; }
+    }
+  }
+  if (done) toast('Marked as printed.');
   renderManage();
 }
 async function printGuides(ids) {
@@ -969,7 +996,7 @@ async function printGuides(ids) {
     toast(list.length > 1 ? `Preview only. On the kiosk, this prints all ${list.length} guides, one page each.` : 'Preview only. On the kiosk, this prints these steps on one page.');
     return;
   }
-  await runPrint(guidePrintHTML(list));
+  await runPrint(guidePrintHTML(list), false);
 }
 
 /* =========================================================
@@ -1090,7 +1117,7 @@ function renderManage() {
                <p class="muted small">Plain letter paper. Each page says in its top corner where it goes in the binder.</p>
                <div class="pages">${pageKeys.map(k => pageHTML(k, actions(k, 'page'))).join('')}</div>` : ''}
              ${cardKeys.length ? `<h2 class="section-title">Jukebox title cards (${cardKeys.length})</h2>
-               <p class="muted small">Cards print 3 to a letter sheet of heavy paper, turned sideways, front side only (${sheets} sheet${sheets > 1 ? 's' : ''} here). Each card has a thin border to line up on the paper cutter, with a small gap between cards to trim away. If you print pages and cards together, load the heavy paper when the card sheets come up.</p>
+               <p class="muted small">Cards print 3 side by side on a landscape letter sheet of heavy paper, front side only (${sheets} sheet${sheets > 1 ? 's' : ''} here). Each card has a thin border to line up on the paper cutter, with a small gap between cards to trim away. Cards print after the binder pages, and the app tells you when to load the card stock.</p>
                <div class="sheet-preview">${sheetPreviewHTML(cardKeys.slice(0, CONFIG.card.perSheet))}
                  <span class="page-cap">How the first sheet prints${sheets > 1 ? ` (1 of ${sheets})` : ''}.</span></div>
                <div class="cards-list">${cardKeys.map(k => pageHTML(k, actions(k, 'card'))).join('')}</div>` : ''}`
@@ -1188,7 +1215,7 @@ const GUIDES = [
       'Tap Pages to print. The number shows how many pages changed.',
       "Tap Print everything, or tap Print this page under one page. Tap Skip for a page you don't need.",
       'The print screen opens. Check that it shows your printer, then tap the round Print button.',
-      'Title cards print 3 to a sheet on heavy paper. Cut them apart on the paper cutter along the thin border around each card.',
+      'Title cards print after the binder pages, 3 to a sheet. When the app asks, put card stock in the manual feed slot and tap Print the cards. Cut them apart on the paper cutter along the thin border around each card.',
       'Each page says in its top corner where it goes. Put it in the binder and throw away the old page.',
       'Back at the tablet, answer whether everything printed. Then tap Clear printed.',
     ] },
