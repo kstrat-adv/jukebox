@@ -457,7 +457,6 @@ h1, h2, h3 { margin: 0; text-wrap: balance; }
 }
 .ask p { font-size: 22px; font-weight: 700; }
 .sync-note { font-size: 15px; color: var(--muted); }
-.sync-note.pin-warn { color: var(--fg); border-left: 4px solid var(--amber); padding: 6px 0 6px 12px; }
 
 /* ---------- Printing ---------- */
 #printArea { display: none; }

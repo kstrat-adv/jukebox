@@ -44,9 +44,6 @@ const CONFIG = {
   // Title card size and sheet layout, in inches. The card size is measured from a photo with a ruler;
   // confirm it with a ruler before the first print run.
   card: { w: 2.9375, h: 4.8125, gap: 0.25, cols: 2, perSheet: 4, sheetW: 8.5, sheetH: 11 },
-  pin: '1234',          // demo only; the real PIN lives in the Sheet's Settings tab
-  pinTries: 4,          // demo only; the Sheet's script enforces the real lockout
-  lockMinutes: [5, 15, 60],
   idleMinutes: 2,
   newDays: 14,
   paper: 'letter',      // binder page size; A5 would need its own entry in PAPER
@@ -77,7 +74,7 @@ function writeJSON(key, v) { try { localStorage.setItem(key, JSON.stringify(v));
 let ALBUMS = [];
 let BY_ID = {};
 let state = { slots: {}, tags: {}, vocab: [], swapLog: [], reprint: [], printed: {}, arrived: [], newIds: [] };
-const remote = { settings: {}, lastSync: {}, loadedAt: 0, offline: false, loaded: false };
+const remote = { settings: {}, lastSync: {}, loadedAt: 0, offline: false, loaded: false, pinRequired: false };
 
 function prepAlbum(a) {
   a.genres = (a.genres || []).map(g => GENRE_LABELS[g] || g);
@@ -132,6 +129,7 @@ function applyCatalog(cat) {
   list.forEach(p => { if (p.printed) state.printed[p.key] = p.printed; });
   state.swapLog = cat.swapLog || [];
   remote.settings = cat.settings || {};
+  remote.pinRequired = cat.pinRequired !== false;   // an older script that doesn't say still wants its PIN
   remote.lastSync = cat.lastSync || {};
   remote.loadedAt = cat.generatedAt || Date.now();
   remote.loaded = true;
@@ -166,6 +164,9 @@ function demoSave() { writeJSON(CONFIG.demoKey, state); reindex(); }
 const LOCAL_SETTINGS_KEY = CONFIG.demoKey + '-settings';
 let localSettings = readJSON(LOCAL_SETTINGS_KEY) || {};
 function setting(key) { return LIVE ? remote.settings[key] : localSettings[key]; }
+// The PIN is optional: it's only asked for when the Sheet's Settings tab has one. The demo never asks.
+function pinRequired() { return LIVE && remote.pinRequired; }
+function unlocked() { return !pinRequired() || ui.unlocked; }
 function idleMs() { return (Number(setting('idle_minutes')) || CONFIG.idleMinutes) * 60000; }
 function jukeboxName() { return setting('jukebox_name') || CONFIG.jukeboxName; }
 function deviceReducesMotion() { try { return matchMedia('(prefers-reduced-motion: reduce)').matches; } catch (e) { return false; } }
@@ -195,6 +196,9 @@ const Store = {
 
 /* =========================================================
    Saving changes
+   A change shows on screen right away. In live mode it also joins a save list that goes to the Sheet
+   in the background, several changes per trip. The list is kept on this device, so a Wi-Fi drop or a
+   reload doesn't lose anything: it's sent as soon as the Sheet can be reached again.
    ========================================================= */
 const Api = {
   async load() {
@@ -214,11 +218,79 @@ const Api = {
   },
 };
 
+const PENDING_KEY = 'jukebox-catalog-pending-v1';
+const Saver = {
+  queue: LIVE ? (readJSON(PENDING_KEY) || []) : [],
+  sending: false,
+  gen: 0,          // goes up after each save, so a catalog load that started before it is ignored
+  retryMs: 0,
+  timer: null,
+  needPin: false,  // a PIN was set or changed in the Sheet: changes wait until it's entered
+  pending() { return this.queue.length; },
+  push(op) { this.queue.push(op); this.persist(); renderRail(); this.kick(300); },   // a short wait lets quick taps share a trip
+  persist() { writeJSON(PENDING_KEY, this.queue); },
+  kick(ms) { this.needPin = false; clearTimeout(this.timer); this.timer = setTimeout(() => this.flush(), ms || 0); },
+  async flush() {
+    if (this.sending || !this.queue.length) return;
+    this.sending = true;
+    renderRail();
+    const batch = this.queue.slice(0, 50);
+    let reload = false, waitForPin = false;
+    try {
+      const r = await Api.post('batch', { ops: batch });
+      remote.offline = false;
+      if (r.ok) {
+        this.queue.splice(0, batch.length);
+        this.gen++;
+        this.retryMs = 0;
+        const bad = (r.results || []).filter(x => !x.ok);
+        if (bad.length) { toast(bad[0].message || "Some changes didn't save."); reload = true; }
+      } else if (r.error === 'pin' || r.error === 'locked') {
+        waitForPin = this.needPin = true;      // the changes wait until the PIN is entered again
+        lockManage();
+        ui.pinError = r.message || '';
+        rerenderAfterChange();
+        toast(r.message || 'Enter the PIN to save your changes.');
+      } else if (r.error === 'busy') {
+        this.retryMs = 30000;                  // the nightly Discogs sync is running
+      } else {
+        this.queue.splice(0, batch.length);    // refused: drop it and show what the Sheet has
+        toast(r.message || "That change didn't save.");
+        reload = true;
+      }
+    } catch (e) {
+      remote.offline = true;
+      this.retryMs = Math.min(Math.max(this.retryMs * 2, 5000), 60000);   // try again in 5 s, 10 s, … up to a minute
+    } finally {
+      this.sending = false;
+      this.persist();
+      renderRail();
+    }
+    if (this.queue.length) { if (!waitForPin) this.kick(this.retryMs); }
+    else scheduleRefresh(reload ? 0 : 15000);    // then check the Sheet once things are quiet
+  },
+};
+
+let refreshTimer;
+// Waits for a quiet moment, so a fresh copy never redraws the screen in the middle of a swap.
+function scheduleRefresh(ms) {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => { if (quietMoment()) refresh(true); else scheduleRefresh(15000); }, ms);
+}
+// Safe moments to redraw from the Sheet: nothing waiting to save, and nobody mid-swap or mid-print.
+function quietMoment() {
+  return !Saver.pending() && !Saver.sending && !ui.sheet && $('#askWrap').hidden &&
+    !(ui.view === 'manage' && ui.manage !== 'home' && ui.manage !== 'history');
+}
+
 async function refresh(quiet) {
   if (!LIVE) return true;
+  const gen = Saver.gen;
   try {
     const cat = await Api.load();
+    if (gen !== Saver.gen || Saver.sending) return false;   // a save landed meanwhile; the next load includes it
     applyCatalog(cat);
+    Saver.queue.forEach(op => applyLocal(op, true));        // changes still waiting to save stay on screen
     remote.offline = false;
     writeJSON(CONFIG.cacheKey, cat);
     rerenderAfterChange();
@@ -232,149 +304,119 @@ async function refresh(quiet) {
   }
 }
 
-async function liveWrite(action, body, okMsg) {
-  if (ui.busy) return { ok: false, busy: true };
-  ui.busy = true;
-  toast('Saving…', true);
-  try {
-    const r = await Api.post(action, body);
-    if (!r.ok) {
-      if (r.error === 'pin' || r.error === 'locked') { lockManage(); ui.pinError = r.message || ''; rerenderAfterChange(); }
-      toast(r.message || "That didn't save. Try again.");
-      return r;
-    }
-    await refresh(true);
-    if (okMsg) toast(typeof okMsg === 'function' ? okMsg(r) : okMsg);
-    return r;
-  } catch (e) {
-    toast("Couldn't reach the catalog. Check the Wi-Fi and try again.");
-    return { ok: false };
-  } finally {
-    ui.busy = false;
-  }
-}
-
 function queueLocal(key) {
   if (!state.reprint.includes(key)) state.reprint.push(key);
   delete state.printed[key];   // changed again since it was printed, so it needs a fresh print
 }
+// Same clean-up the Sheet's script does: no semicolons (they separate tags), at most 30 characters.
+function cleanTag(tag) {
+  return String(tag).replace(/[;\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 30).trim();
+}
+function tagName(t) { return state.vocab.find(v => v.toLowerCase() === t.toLowerCase()) || t; }
 
-// Demo copy of the Sheet's lockout, so the preview behaves like the real thing.
-const demoGuard = { fails: 0, until: 0, lockouts: 0 };
-function demoPin(pin) {
-  const now = Date.now();
-  const paused = ms => { const m = Math.max(1, Math.ceil(ms / 60000)); return { ok: false, message: `Too many wrong PINs. Manage is paused for ${m} minute${m === 1 ? '' : 's'}.` }; };
-  if (now < demoGuard.until) return paused(demoGuard.until - now);
-  if (pin === CONFIG.pin) { Object.assign(demoGuard, { fails: 0, until: 0, lockouts: 0 }); return { ok: true }; }
-  const wait = CONFIG.lockMinutes[Math.min(demoGuard.lockouts, CONFIG.lockMinutes.length - 1)];
-  if (++demoGuard.fails >= CONFIG.pinTries) {
-    Object.assign(demoGuard, { fails: 0, until: now + wait * 60000, lockouts: demoGuard.lockouts + 1 });
-    return paused(wait * 60000);
+// One change, applied to what's on screen. The Sheet's script makes the same change when it gets it.
+// replay is true when a change still waiting to save is laid back over a fresh copy of the catalog.
+function applyLocal(op, replay) {
+  switch (op.action) {
+    case 'swap': {
+      const out = state.slots[op.slot] || null;
+      if (op.incoming) state.slots[op.slot] = { id: op.incoming.id, disc: op.incoming.disc }; else delete state.slots[op.slot];
+      if (!replay) state.swapLog.unshift({ at: Date.now(), slot: op.slot, out, in: op.incoming || null });
+      queueLocal('index:' + (Math.floor(op.slot / CONFIG.indexPerPage) + 1));
+      queueLocal('card:' + Math.floor(op.slot / CONFIG.slotsPerCard));
+      if (out && !(op.incoming && out.id === op.incoming.id && out.disc === op.incoming.disc)) queueLocal('album:' + out.id);
+      if (op.incoming) queueLocal('album:' + op.incoming.id);
+      break;
+    }
+    case 'tagAdd': {
+      const name = tagName(op.tag);
+      if (!state.vocab.includes(name)) state.vocab.push(name);
+      const list = state.tags[op.id] = state.tags[op.id] || [];
+      if (!list.includes(name)) list.push(name);
+      break;
+    }
+    case 'tagRemove': state.tags[op.id] = (state.tags[op.id] || []).filter(x => x !== op.tag); break;
+    case 'queue': op.keys.forEach(queueLocal); break;
+    case 'printed': { const now = Date.now(); op.keys.forEach(k => { if (state.reprint.includes(k)) state.printed[k] = state.printed[k] || now; }); break; }
+    case 'skip': state.reprint = state.reprint.filter(k => k !== op.key); delete state.printed[op.key]; break;
+    case 'clearPrinted': state.reprint = state.reprint.filter(k => !state.printed[k]); state.printed = {}; break;
+    case 'setting':
+      if (LIVE) remote.settings[op.key] = op.value;
+      else { localSettings = Object.assign({}, localSettings, { [op.key]: op.value }); writeJSON(LOCAL_SETTINGS_KEY, localSettings); }
+      break;
+    default: break;
   }
-  const left = CONFIG.pinTries - demoGuard.fails;
-  return { ok: false, message: `That PIN didn't match. ${left} ${left === 1 ? 'try' : 'tries'} left before a ${wait}-minute wait.` };
+  reindex();
+}
+// Show the change now; in live mode, also send it to the Sheet.
+function change(op, msg) {
+  applyLocal(op);
+  if (LIVE) Saver.push(op); else demoSave();
+  if (msg) toast(msg);
+  return { ok: true };
 }
 
 const Actions = {
-  // Returns { ok, message, defaultPin }, or { net: true } when the Sheet can't be reached.
+  // Only used when a PIN is set in the Sheet. Returns { ok, message }, or { net: true } when the Sheet can't be reached.
   async verifyPin(pin) {
-    if (!LIVE) return demoPin(pin);
     try {
       const r = await Api.post('verifyPin', { pin });
-      return { ok: !!r.ok, message: r.message, defaultPin: !!r.defaultPin };
+      return { ok: !!r.ok, message: r.message };
     } catch (e) {
       return { ok: false, net: true };
     }
   },
-  async swap(slot, incoming) {
+  swap(slot, incoming) {
     const out = state.slots[slot] || null;
-    if (LIVE) {
-      const r = await liveWrite('swap', { slot, incoming });
-      return r.ok ? { ok: true, out } : r;
-    }
-    if (incoming) state.slots[slot] = { id: incoming.id, disc: incoming.disc }; else delete state.slots[slot];
-    state.swapLog.unshift({ at: Date.now(), slot, out, in: incoming || null });
-    queueLocal('index:' + (Math.floor(slot / CONFIG.indexPerPage) + 1));
-    queueLocal('card:' + Math.floor(slot / CONFIG.slotsPerCard));
-    if (out) queueLocal('album:' + out.id);
-    if (incoming) queueLocal('album:' + incoming.id);
-    demoSave();
+    change({ action: 'swap', slot, incoming: incoming ? { id: incoming.id, disc: incoming.disc } : null });
     return { ok: true, out };
   },
-  async addTag(id, tag) {
-    const t = tag.trim().replace(/\s+/g, ' ');
+  addTag(id, tag) {
+    const t = cleanTag(tag);
     if (!t) return { ok: false };
-    if (LIVE) return liveWrite('tagAdd', { id, tag: t }, r => (r.already ? 'That tag is already on this album.' : `Added ${r.name}.`));
-    const name = state.vocab.find(v => v.toLowerCase() === t.toLowerCase()) || t;
-    if (!state.vocab.includes(name)) state.vocab.push(name);
-    const list = state.tags[id] = state.tags[id] || [];
-    if (list.includes(name)) { toast('That tag is already on this album.'); return { ok: true }; }
-    list.push(name);
-    demoSave();
-    toast(`Added ${name}.`);
-    return { ok: true };
+    const name = tagName(t);
+    if (Store.tagsOf(id).includes(name)) { toast('That tag is already on this album.'); return { ok: true }; }
+    return change({ action: 'tagAdd', id, tag: t }, `Added ${name}.`);
   },
-  async removeTag(id, tag) {
-    if (LIVE) return liveWrite('tagRemove', { id, tag }, `Removed ${tag}.`);
-    state.tags[id] = (state.tags[id] || []).filter(x => x !== tag);
-    demoSave();
-    toast(`Removed ${tag}.`);
-    return { ok: true };
+  removeTag(id, tag) { return change({ action: 'tagRemove', id, tag }, `Removed ${tag}.`); },
+  queue(keys, msg) { return change({ action: 'queue', keys }, msg); },
+  printed(keys) { return change({ action: 'printed', keys }); },
+  skip(key, msg) { return change({ action: 'skip', key }, msg); },
+  clearPrinted() { return change({ action: 'clearPrinted' }, 'Printed items cleared from the list.'); },
+  setMotion(on) {
+    return change({ action: 'setting', key: 'idle_motion', value: on ? 'on' : 'off' }, on ? 'Moving covers are on.' : 'Moving covers are off.');
   },
-  async queue(keys, msg) {
-    if (LIVE) return liveWrite('queue', { keys }, msg);
-    keys.forEach(queueLocal);
-    demoSave();
-    if (msg) toast(msg);
-    return { ok: true };
-  },
-  async printed(keys) {
-    if (LIVE) return liveWrite('printed', { keys });
-    const now = Date.now();
-    keys.forEach(k => { state.printed[k] = now; });
-    demoSave();
-    return { ok: true };
-  },
-  async skip(key, msg) {
-    if (LIVE) return liveWrite('skip', { key }, msg);
-    state.reprint = state.reprint.filter(k => k !== key);
-    delete state.printed[key];
-    demoSave();
-    toast(msg);
-    return { ok: true };
-  },
-  async clearPrinted() {
-    const msg = 'Printed items cleared from the list.';
-    if (LIVE) return liveWrite('clearPrinted', {}, msg);
-    state.reprint = state.reprint.filter(k => !state.printed[k]);
-    state.printed = {};
-    demoSave();
-    toast(msg);
-    return { ok: true };
-  },
+  // Checking Discogs is the one change that waits for the Sheet, since the new albums come back with the answer.
   async sync() {
-    if (LIVE) {
-      return liveWrite('sync', {}, r => {
-        const s = r.result || {};
-        let m = s.added ? `${s.added} new album${s.added > 1 ? 's' : ''} from Discogs.` : 'No new albums since the last check.';
-        if (s.remaining) m += ` Details for ${s.remaining} more are still coming in.`;
-        return m;
-      });
+    if (!LIVE) {
+      const incoming = SAMPLE.pending.filter(id => !state.arrived.includes(id));
+      incoming.forEach(id => { state.arrived.push(id); state.newIds.push(id); queueLocal('album:' + id); });
+      demoSave();
+      toast(incoming.length ? `${incoming.length} new album from Discogs: ${incoming.map(id => BY_ID[id].title).join(', ')}.` : 'No new albums since the last check.');
+      return { ok: true };
     }
-    const incoming = SAMPLE.pending.filter(id => !state.arrived.includes(id));
-    incoming.forEach(id => { state.arrived.push(id); state.newIds.push(id); queueLocal('album:' + id); });
-    demoSave();
-    toast(incoming.length ? `${incoming.length} new album from Discogs: ${incoming.map(id => BY_ID[id].title).join(', ')}.` : 'No new albums since the last check.');
-    return { ok: true };
-  },
-  async setMotion(on) {
-    const value = on ? 'on' : 'off';
-    const msg = on ? 'Moving covers are on.' : 'Moving covers are off.';
-    if (LIVE) return liveWrite('setting', { key: 'idle_motion', value }, msg);
-    localSettings = Object.assign({}, localSettings, { idle_motion: value });
-    writeJSON(LOCAL_SETTINGS_KEY, localSettings);
-    toast(msg);
-    return { ok: true };
+    if (ui.busy) return { ok: false };
+    ui.busy = true;
+    toast('Checking Discogs. This can take up to half a minute…', true);
+    try {
+      const r = await Api.post('sync', {});
+      if (!r.ok) {
+        if (r.error === 'pin' || r.error === 'locked') { lockManage(); ui.pinError = r.message || ''; rerenderAfterChange(); }
+        toast(r.message || "Discogs didn't answer. Try again in a few minutes.");
+        return r;
+      }
+      const s = r.result || {};
+      let m = s.added ? `${s.added} new album${s.added > 1 ? 's' : ''} from Discogs.` : 'No new albums since the last check.';
+      if (s.remaining) m += ` Details for ${s.remaining} more are still coming in.`;
+      toast(m);
+      if (!Saver.pending()) refresh(true);
+      return r;
+    } catch (e) {
+      toast("Couldn't reach the catalog. Check the Wi-Fi and try again.");
+      return { ok: false };
+    } finally {
+      ui.busy = false;
+    }
   },
   reset() { state = demoFresh(); demoSave(); },
 };
@@ -455,6 +497,7 @@ const ICON = {
   lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
   unlock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 7.6-1.8"/></svg>',
   disc: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.6"/></svg>',
+  sliders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>',
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>',
 };
 
@@ -467,7 +510,7 @@ const ui = {
   decades: new Set(), genres: new Set(), tags: new Set(), formats: new Set(), onlyJuke: false,
   sort: 'artist',
   allSongs: false,
-  unlocked: false, pin: '', pinError: '', pinValue: '', checkingPin: false, defaultPin: false,
+  unlocked: false, pin: '', pinError: '', pinValue: '', checkingPin: false,
   manage: 'home',            // home | swap-slot | swap-pick | swap-confirm | swap-done | print | history
   swap: { slot: null, incoming: null, fromAlbum: false, q: '' },
   sheet: null,               // { id, disc, track }
@@ -480,9 +523,15 @@ const ui = {
    Rail
    ========================================================= */
 function renderRail() {
-  $('#navManage').innerHTML = `${ui.unlocked ? ICON.unlock : ICON.lock}<span>Manage</span>`;
+  $('#navManage').innerHTML = `${pinRequired() ? (ui.unlocked ? ICON.unlock : ICON.lock) : ICON.sliders}<span>Manage</span>`;
   let sync = '';
-  if (LIVE) {
+  const waiting = Saver.pending();
+  if (LIVE && waiting) {
+    const what = `${waiting} change${waiting > 1 ? 's' : ''}`;
+    sync = remote.offline ? `<span class="rail-sync offline">Offline · ${what} waiting to save</span>`
+      : Saver.needPin ? `<span class="rail-sync offline">${what} waiting for the PIN</span>`
+      : `<span class="rail-sync">Saving ${what}…</span>`;
+  } else if (LIVE) {
     sync = remote.offline
       ? `<span class="rail-sync offline">Offline${remote.loadedAt ? ` · saved copy from ${clock(remote.loadedAt)}` : ''}</span>`
       : remote.loadedAt ? `<span class="rail-sync">Updated ${clock(remote.loadedAt)}</span>` : '';
@@ -662,21 +711,21 @@ function renderSheet() {
       <span>Punch in the number next to a song to play it.</span></div>`;
   } else {
     where = `<div class="where where-shelf"><span class="where-label"><span class="muted">${isCD ? 'Not in the jukebox' : esc(a.format)}</span><strong>On the shelf</strong></span>
-      ${ui.unlocked && isCD ? `<button class="btn btn-primary" data-load-album="${esc(a.id)}">Put it in the jukebox</button>` : ''}</div>`;
+      ${unlocked() && isCD ? `<button class="btn btn-primary" data-load-album="${esc(a.id)}">Put it in the jukebox</button>` : ''}</div>`;
   }
-  if (slots.length && unloaded.length && ui.unlocked) {
+  if (slots.length && unloaded.length && unlocked()) {
     where += `<div class="where where-shelf"><span class="where-label"><span class="muted">Still on the shelf</span><strong>Disc ${unloaded.join(', ')}</strong></span>
       <button class="btn btn-primary" data-load-album="${esc(a.id)}">Put it in the jukebox</button></div>`;
   }
 
   const tags = Store.tagsOf(a.id);
   const tagChips = tags.length
-    ? tags.map(t => ui.unlocked
+    ? tags.map(t => unlocked()
       ? `<span class="tag">${esc(t)}<button class="tag-x" data-tag-remove="${esc(t)}" aria-label="Remove ${esc(t)}">×</button></span>`
       : `<span class="tag">${esc(t)}</span>`).join('')
     : '<span class="muted">No tags yet.</span>';
   const suggestions = state.vocab.filter(t => !tags.includes(t));
-  const tagTools = ui.unlocked
+  const tagTools = unlocked()
     ? `${suggestions.length ? `<div class="tagrow">${suggestions.map(t => `<button class="tag tag-add" data-tag-add="${esc(t)}">+ ${esc(t)}</button>`).join('')}</div>` : ''}
        <form class="tag-new" id="tagForm"><label for="tagNew" class="sr-only">New tag name</label>
          <input id="tagNew" placeholder="Make a new tag" maxlength="24" autocomplete="off"><button class="btn btn-secondary" type="submit">Add tag</button></form>`
@@ -706,7 +755,7 @@ function renderSheet() {
       </div>
     </div>
     ${where}
-    ${ui.unlocked ? `<div class="frow"><button class="btn btn-secondary" data-queue-album="${esc(a.id)}">Reprint this album's page</button></div>` : ''}
+    ${unlocked() ? `<div class="frow"><button class="btn btn-secondary" data-queue-album="${esc(a.id)}">Reprint this album's page</button></div>` : ''}
     <section class="detail-sec"><h3 class="section-title">Your tags</h3><div class="tagrow">${tagChips}</div>${tagTools}</section>
     <section class="detail-sec"><h3 class="section-title">Songs${multi ? ` · ${a.discs.length} discs` : ''}</h3><div class="tracks">${trackHTML}</div></section>`;
 }
@@ -920,8 +969,8 @@ function renderPickList() {
 }
 function renderManage() {
   const el = $('#view-manage');
-  if (!ui.unlocked) {
-    const msg = ui.checkingPin ? 'Checking…' : ui.pinError ? ui.pinError : LIVE ? '' : 'Sample PIN: 1234';
+  if (!unlocked()) {
+    const msg = ui.checkingPin ? 'Checking…' : ui.pinError || '';
     el.innerHTML = `<div class="lock">
       <header class="view-head"><h1>Manage</h1><p>Enter the PIN to swap discs, change tags, and print.</p></header>
       <div class="pin-dots" aria-label="${ui.pin.length} of 4 digits entered">${[0, 1, 2, 3].map(i => `<span class="${i < ui.pin.length ? 'on' : ''}"></span>`).join('')}</div>
@@ -1043,7 +1092,10 @@ function renderManage() {
       const ls = remote.lastSync || {};
       const syncNote = LIVE && ls.when
         ? `<p class="sync-note">Last Discogs check: ${when(ls.when)}${ls.remaining ? `. Details for ${Number(ls.remaining) || 0} albums are still coming in.` : '.'}${ls.error ? ` It stopped with this message: ${esc(ls.error)}` : ''}</p>` : '';
-      el.innerHTML = `<header class="view-head"><h1>Manage</h1><p>Unlocked. It locks again by itself after ${Number(setting('idle_minutes')) || CONFIG.idleMinutes} minutes without a touch.</p></header>
+      const intro = pinRequired()
+        ? `Unlocked. It locks again by itself after ${Number(setting('idle_minutes')) || CONFIG.idleMinutes} minutes without a touch.`
+        : 'Swap discs, print pages and title cards, and bring in new albums from Discogs.';
+      el.innerHTML = `<header class="view-head"><h1>Manage</h1><p>${intro}</p></header>
         <div class="tiles">
           <button class="tile" data-manage="swap-slot"><span class="tile-title">Swap a disc</span><span class="tile-desc">Change what's in a jukebox slot.</span></button>
           <button class="tile" data-manage="print"><span class="tile-title">Pages to print${n ? ` <span class="count">${n}</span>` : ''}</span><span class="tile-desc">${n ? `${n} item${n > 1 ? 's' : ''} waiting to print.` : 'The binder and the jukebox cards are up to date.'}</span></button>
@@ -1051,14 +1103,13 @@ function renderManage() {
           <button class="tile" data-manage="history"><span class="tile-title">Swap history</span><span class="tile-desc">${state.swapLog.length ? `${state.swapLog.length} swap${state.swapLog.length > 1 ? 's' : ''} recorded.` : 'No swaps yet.'}</span></button>
         </div>
         ${syncNote}
-        ${ui.defaultPin ? '<p class="sync-note pin-warn"><strong>The PIN is still 1234.</strong> Change it in the Sheet\'s Settings tab, on the pin row.</p>' : ''}
         <section class="detail-sec"><h2 class="section-title">Idle screen</h2>
           <div class="frow"><button class="toggle" data-motion aria-pressed="${motionOn()}">${ICON.disc}Moving covers: ${motionOn() ? 'On' : 'Off'}</button>
             <button class="btn btn-secondary" data-idle-preview>Show it now</button></div>
           ${motionSetting() === 'auto' ? `<p class="muted small">This follows the device's own animation setting until you change it here.</p>` : ''}
         </section>
-        <p class="muted">To change an album's tags, open it from Find music while Manage is unlocked.</p>
-        <div class="frow"><button class="btn btn-secondary" data-lock>${ICON.lock}Lock</button>
+        <p class="muted">To change an album's tags, open it from Find music${pinRequired() ? ' while Manage is unlocked' : ''}.</p>
+        <div class="frow">${pinRequired() ? `<button class="btn btn-secondary" data-lock>${ICON.lock}Lock</button>` : ''}
           ${LIVE ? '' : `<button class="btn btn-warn" data-reset>${ui.resetArmed ? 'Tap again to reset' : 'Reset sample data'}</button>`}</div>`;
     }
   }
@@ -1109,6 +1160,15 @@ const GUIDES = [
       'Each page says in its top corner where it goes. Put it in the binder and throw away the old page.',
       'Back at the tablet, answer whether everything printed. Then tap Clear printed.',
     ] },
+  { id: 'clear', title: 'Clear the play queue',
+    note: 'Use this to skip the songs that are lined up. It clears every song waiting to play.',
+    steps: [
+      'Unlock and open the jukebox.',
+      'Move the SERVICE switch to SERVICE.',
+      'Type 8 3, then press POPULAR. The display says CLEAR SELECTIONS.',
+      'Move the SERVICE switch back to NORMAL.',
+      'Close the jukebox.',
+    ] },
   { id: 'find', title: 'Find a song to play',
     steps: [
       'Tap Find music.',
@@ -1139,7 +1199,7 @@ function closeHelp() { $('#helpWrap').hidden = true; }
    ========================================================= */
 let idleTimer;
 function bump() { clearTimeout(idleTimer); idleTimer = setTimeout(goIdle, idleMs()); }
-function lockManage() { ui.unlocked = false; ui.pin = ''; ui.pinValue = ''; ui.pinError = ''; ui.defaultPin = false; ui.manage = 'home'; ui.resetArmed = false; }
+function lockManage() { ui.unlocked = false; ui.pin = ''; ui.pinValue = ''; ui.pinError = ''; ui.manage = 'home'; ui.resetArmed = false; }
 function goIdle() {
   if (!$('#askWrap').hidden) { bump(); return; }   // don't interrupt a print question
   lockManage();
@@ -1149,14 +1209,33 @@ function goIdle() {
   setView('find');
   showIdle();
 }
+// Two rows of covers drifting in opposite directions. Each row holds enough covers to fill a wide
+// screen and repeats once, so the loop is seamless. With only a few discs loaded, covers from the
+// rest of the collection fill in, and the heading changes to match.
+const IDLE_MIN = 12;          // covers per row before it repeats
+const IDLE_SPEED = 20;        // pixels per second
+const IDLE_STEP = 168;        // one cover (150px) plus the gap (18px)
 function showIdle() {
-  const ids = [...new Set(Object.values(state.slots).map(v => v.id))].filter(id => BY_ID[id]);
-  const list = (ids.length ? ids : Store.albums().slice(0, 40).map(a => a.id)).map(id => BY_ID[id]);
+  const loaded = [...new Set(Object.values(state.slots).map(v => v.id))].filter(id => BY_ID[id]);
+  let ids = loaded.slice();
+  if (ids.length < IDLE_MIN) {
+    const rest = Store.albums().map(a => a.id).filter(id => !ids.includes(id)).sort((x, y) => hash(x) - hash(y));
+    ids = ids.concat(rest.slice(0, IDLE_MIN - ids.length));
+  }
+  const list = ids.map(id => BY_ID[id]);
   if (!list.length) return;
+  $('#idle h2').textContent = ids.length === loaded.length ? 'Now in the Jukebox' : 'Jukebox Catalog';
+  // Enough covers for two different rows: split them. Otherwise both rows show all of them, the second one shifted.
   const half = Math.ceil(list.length / 2);
-  const rowA = list.slice(0, half), rowB = list.slice(half).concat(list.slice(0, Math.max(0, half - (list.length - half))));
-  const row = (items, cls) => `<div class="idle-row ${cls}">${items.concat(items).map(coverHTML).join('')}</div>`;
-  $('#idleRows').innerHTML = row(rowA, '') + row(rowB.length ? rowB : rowA, 'rev');
+  const rowA = list.length >= IDLE_MIN * 2 ? list.slice(0, half) : list;
+  const rowB = list.length >= IDLE_MIN * 2 ? list.slice(half) : list.slice(half).concat(list.slice(0, half));
+  const fill = items => { let out = items.slice(); while (out.length < IDLE_MIN) out = out.concat(items); return out; };
+  const row = (items, cls) => {
+    const seq = fill(items);
+    const secs = Math.round(seq.length * IDLE_STEP / IDLE_SPEED);   // same speed however many covers
+    return `<div class="idle-row ${cls}" style="animation-duration:${secs}s">${seq.concat(seq).map(coverHTML).join('')}</div>`;
+  };
+  $('#idleRows').innerHTML = row(rowA, '') + row(rowB, 'rev');
   $('#idle').classList.toggle('still', !motionOn());
   $('#idle').hidden = false;
 }
@@ -1184,7 +1263,7 @@ async function onClick(e) {
   if (d.printGuide) { await printGuides(d.printGuide); return; }
   if ('helpStart' in d) {
     closeHelp(); closeSheet(); setView('manage');
-    if (ui.unlocked) { ui.swap = fresh(); ui.manage = 'swap-slot'; renderManage(); }
+    if (unlocked()) { ui.swap = fresh(); ui.manage = 'swap-slot'; renderManage(); }
     return;
   }
   if (d.view) { closeSheet(); setView(d.view); return; }
@@ -1227,13 +1306,13 @@ async function onClick(e) {
       ui.checkingPin = true; renderManage();
       const r = await Actions.verifyPin(pin);
       ui.checkingPin = false; ui.pin = '';
-      if (r.ok) { ui.unlocked = true; ui.pinValue = pin; ui.defaultPin = r.defaultPin; ui.manage = 'home'; toast('Manage is unlocked.'); }
+      if (r.ok) { ui.unlocked = true; ui.pinValue = pin; ui.manage = 'home'; toast('Manage is unlocked.'); Saver.kick(0); }
       else ui.pinError = r.net ? "Couldn't check the PIN. Check the Wi-Fi and try again." : (r.message || "That PIN didn't match. Try again.");
     }
     renderRail(); renderManage();
     return;
   }
-  if (!ui.unlocked && !('closeSheet' in d)) {
+  if (!unlocked() && !('closeSheet' in d)) {
     // Everything below needs Manage unlocked.
     if (d.manage || d.loadAlbum || d.tagAdd || d.tagRemove || d.queueAlbum) return;
   }
@@ -1336,8 +1415,10 @@ document.addEventListener('submit', e => {
   if (e.target.id !== 'tagForm') return;
   e.preventDefault();
   const input = $('#tagNew');
-  if (!ui.sheet || !ui.unlocked || !input.value.trim()) return;
-  Actions.addTag(ui.sheet.id, input.value).then(() => { renderSheet(); if (ui.view === 'find') renderFind(); });
+  if (!ui.sheet || !unlocked() || !input.value.trim()) return;
+  Actions.addTag(ui.sheet.id, input.value);
+  renderSheet();
+  if (ui.view === 'find') renderFind();
 });
 
 document.addEventListener('input', e => {
@@ -1360,7 +1441,7 @@ document.addEventListener('error', e => {
   if (el && el.tagName === 'IMG' && el.parentNode && el.parentNode.classList && el.parentNode.classList.contains('cover')) el.remove();
 }, true);
 
-$('#idle').addEventListener('click', () => { $('#idle').hidden = true; bump(); refresh(true); });
+$('#idle').addEventListener('click', () => { $('#idle').hidden = true; bump(); if (quietMoment()) refresh(true); });
 // A new #api= address typed into the page address takes effect right away.
 window.addEventListener('hashchange', () => { if (/[#&]api=/.test(location.hash)) location.reload(); });
 ['pointerdown', 'keydown', 'input'].forEach(ev => document.addEventListener(ev, bump, { passive: true }));
@@ -1370,10 +1451,12 @@ window.addEventListener('hashchange', () => { if (/[#&]api=/.test(location.hash)
    ========================================================= */
 if (LIVE) {
   const cached = readJSON(CONFIG.cacheKey);
-  if (cached && cached.ok) { try { applyCatalog(cached); } catch (e) { /* stale cache: ignore */ } }
+  if (cached && cached.ok) {
+    try { applyCatalog(cached); Saver.queue.forEach(op => applyLocal(op, true)); } catch (e) { /* stale cache: ignore */ }
+  }
   renderRail(); renderFind();
-  refresh(true);
-  setInterval(() => { if (!ui.unlocked && !ui.sheet && !ui.busy) refresh(true); }, CONFIG.refreshMs);
+  if (Saver.pending()) Saver.kick(0); else refresh(true);   // unsaved changes from last time go first
+  setInterval(() => { if (quietMoment()) refresh(true); }, CONFIG.refreshMs);
 } else {
   $('#demoNote').hidden = false;
   state = demoLoad();
